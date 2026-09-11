@@ -1,0 +1,33 @@
+{
+  "task_id": "evaluation_10000_1789137516603_9496b0e6_default",
+  "dataset_id": "default",
+  "status": "success",
+  "status_code": 2,
+  "total": 1,
+  "finished": 1,
+  "chat_model_id": "9ffe7acb-152a-4f4e-abed-8734b0774b81",
+  "chat_model_name": "gpt5.6",
+  "rerank_model_id": "",
+  "retrieval_metrics": {
+    "precision": 0,
+    "recall": 0,
+    "ndcg3": 0,
+    "ndcg10": 0,
+    "mrr": 0,
+    "map": 0
+  },
+  "generation_metrics": {
+    "bleu1": 0.0524851725267794,
+    "bleu2": 0.055668932108147405,
+    "bleu4": 0.0636991580240073,
+    "rouge1": 0,
+    "rouge2": 0,
+    "rougel": 0
+  },
+  "notes": [
+    "Official default evaluation API completed successfully.",
+    "A temporary evaluation knowledge base was used; the existing loc knowledge base was not passed to the evaluator.",
+    "Retrieval metrics are zero because the official corpus is unrelated to the user's current EM-Net/LocUNet document; this is a dataset-domain mismatch, not an API failure.",
+    "No API key or provider credential is included in this artifact."
+  ]
+}

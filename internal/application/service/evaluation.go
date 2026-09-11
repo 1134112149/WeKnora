@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
@@ -14,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
 	"golang.org/x/sync/errgroup"
+	"gorm.io/gorm"
 )
 
 /*
@@ -32,6 +34,7 @@ type EvaluationService struct {
 	knowledgeService     interfaces.KnowledgeService     // Service for knowledge operations
 	sessionService       interfaces.SessionService       // Service for chat sessions
 	modelService         interfaces.ModelService         // Service for model operations
+	db                   *gorm.DB                        // Durable evaluation task store
 
 	evaluationMemoryStorage *evaluationMemoryStorage // In-memory storage for evaluation tasks
 }
@@ -43,6 +46,7 @@ func NewEvaluationService(
 	knowledgeService interfaces.KnowledgeService,
 	sessionService interfaces.SessionService,
 	modelService interfaces.ModelService,
+	db *gorm.DB,
 ) interfaces.EvaluationService {
 	evaluationMemoryStorage := newEvaluationMemoryStorage()
 	return &EvaluationService{
@@ -52,8 +56,77 @@ func NewEvaluationService(
 		knowledgeService:        knowledgeService,
 		sessionService:          sessionService,
 		modelService:            modelService,
+		db:                      db,
 		evaluationMemoryStorage: evaluationMemoryStorage,
 	}
+}
+
+// evaluationTaskRow is the durable projection of an evaluation detail. The
+// request parameters and metric payload are JSON so new fields can be added
+// without another schema migration.
+type evaluationTaskRow struct {
+	ID        string     `gorm:"column:id;primaryKey"`
+	TenantID  uint64     `gorm:"column:tenant_id;not null;index"`
+	DatasetID string     `gorm:"column:dataset_id;not null"`
+	StartTime time.Time  `gorm:"column:start_time;not null"`
+	Status    int        `gorm:"column:status;not null"`
+	ErrMsg    string     `gorm:"column:err_msg"`
+	Total     int        `gorm:"column:total;not null;default:0"`
+	Finished  int        `gorm:"column:finished;not null;default:0"`
+	Params    types.JSON `gorm:"column:params_json;type:jsonb;not null"`
+	Metric    types.JSON `gorm:"column:metric_json;type:jsonb"`
+}
+
+func (evaluationTaskRow) TableName() string { return "evaluation_tasks" }
+
+func (e *EvaluationService) persistEvaluationDetail(ctx context.Context, detail *types.EvaluationDetail) error {
+	if e.db == nil || detail == nil || detail.Task == nil {
+		return nil
+	}
+	params, err := json.Marshal(detail.Params)
+	if err != nil {
+		return fmt.Errorf("marshal evaluation params: %w", err)
+	}
+	metric, err := json.Marshal(detail.Metric)
+	if err != nil {
+		return fmt.Errorf("marshal evaluation metric: %w", err)
+	}
+	row := &evaluationTaskRow{
+		ID: detail.Task.ID, TenantID: detail.Task.TenantID, DatasetID: detail.Task.DatasetID,
+		StartTime: detail.Task.StartTime, Status: int(detail.Task.Status), ErrMsg: detail.Task.ErrMsg,
+		Total: detail.Task.Total, Finished: detail.Task.Finished, Params: types.JSON(params), Metric: types.JSON(metric),
+	}
+	return e.db.WithContext(ctx).Save(row).Error
+}
+
+func (e *EvaluationService) loadEvaluationDetail(ctx context.Context, taskID string) (*types.EvaluationDetail, error) {
+	if e.db == nil {
+		return nil, errors.New("task not found")
+	}
+	var row evaluationTaskRow
+	if err := e.db.WithContext(ctx).Where("id = ?", taskID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("task not found")
+		}
+		return nil, err
+	}
+	detail := &types.EvaluationDetail{Task: &types.EvaluationTask{
+		ID: row.ID, TenantID: row.TenantID, DatasetID: row.DatasetID, StartTime: row.StartTime,
+		Status: types.EvaluationStatue(row.Status), ErrMsg: row.ErrMsg, Total: row.Total, Finished: row.Finished,
+	}}
+	if len(row.Params) > 0 && string(row.Params) != "null" {
+		detail.Params = &types.ChatManage{}
+		if err := json.Unmarshal([]byte(row.Params), detail.Params); err != nil {
+			return nil, fmt.Errorf("unmarshal evaluation params: %w", err)
+		}
+	}
+	if len(row.Metric) > 0 && string(row.Metric) != "null" {
+		detail.Metric = &types.MetricResult{}
+		if err := json.Unmarshal([]byte(row.Metric), detail.Metric); err != nil {
+			return nil, fmt.Errorf("unmarshal evaluation metric: %w", err)
+		}
+	}
+	return detail, nil
 }
 
 // evaluationMemoryStorage stores evaluation tasks in memory with thread-safe access
@@ -88,7 +161,7 @@ func (e *evaluationMemoryStorage) get(taskID string) (*types.EvaluationDetail, e
 	return res, nil
 }
 
-func (e *evaluationMemoryStorage) update(taskID string, fn func(params *types.EvaluationDetail)) error {
+func (e *evaluationMemoryStorage) update(ctx context.Context, taskID string, fn func(params *types.EvaluationDetail), persist func(context.Context, *types.EvaluationDetail) error) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	params, ok := e.store[taskID]
@@ -96,6 +169,11 @@ func (e *evaluationMemoryStorage) update(taskID string, fn func(params *types.Ev
 		return errors.New("task not found")
 	}
 	fn(params)
+	if persist != nil {
+		if err := persist(ctx, params); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -105,8 +183,11 @@ func (e *EvaluationService) EvaluationResult(ctx context.Context, taskID string)
 
 	detail, err := e.evaluationMemoryStorage.get(taskID)
 	if err != nil {
-		logger.Errorf(ctx, "Failed to get evaluation task: %v", err)
-		return nil, err
+		detail, err = e.loadEvaluationDetail(ctx, taskID)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to get evaluation task: %v", err)
+			return nil, err
+		}
 	}
 
 	tenantID := types.MustTenantIDFromContext(ctx)
@@ -298,6 +379,10 @@ func (e *EvaluationService) Evaluation(ctx context.Context,
 
 	// Store evaluation task in memory storage
 	logger.Info(ctx, "Registering evaluation task")
+	if err := e.persistEvaluationDetail(ctx, detail); err != nil {
+		logger.Errorf(ctx, "Failed to persist evaluation task: %v", err)
+		return nil, err
+	}
 	e.evaluationMemoryStorage.register(detail)
 
 	// Start evaluation in background goroutine
@@ -309,12 +394,18 @@ func (e *EvaluationService) Evaluation(ctx context.Context,
 
 		// Update task status to running
 		detail.Task.Status = types.EvaluationStatueRunning
+		if err := e.persistEvaluationDetail(newCtx, detail); err != nil {
+			logger.Errorf(newCtx, "Failed to persist running evaluation task: %v", err)
+		}
 		logger.Info(newCtx, "Evaluation task status set to running")
 
 		// Execute actual evaluation
 		if err := e.EvalDataset(newCtx, detail, knowledgeBaseID); err != nil {
 			detail.Task.Status = types.EvaluationStatueFailed
 			detail.Task.ErrMsg = err.Error()
+			if persistErr := e.persistEvaluationDetail(newCtx, detail); persistErr != nil {
+				logger.Errorf(newCtx, "Failed to persist failed evaluation task: %v", persistErr)
+			}
 			logger.Errorf(newCtx, "Evaluation task failed: %v, task ID: %s", err, taskID)
 			return
 		}
@@ -322,6 +413,9 @@ func (e *EvaluationService) Evaluation(ctx context.Context,
 		// Mark task as completed successfully
 		logger.Infof(newCtx, "Evaluation task completed successfully, task ID: %s", taskID)
 		detail.Task.Status = types.EvaluationStatueSuccess
+		if persistErr := e.persistEvaluationDetail(newCtx, detail); persistErr != nil {
+			logger.Errorf(newCtx, "Failed to persist successful evaluation task: %v", persistErr)
+		}
 	}()
 
 	logger.Infof(ctx, "Evaluation task created successfully, task ID: %s", taskID)
@@ -343,10 +437,12 @@ func (e *EvaluationService) EvalDataset(ctx context.Context, detail *types.Evalu
 	logger.Infof(ctx, "Dataset retrieved successfully with %d QA pairs", len(dataset))
 
 	// Update total QA pairs count in task details
-	e.evaluationMemoryStorage.update(detail.Task.ID, func(params *types.EvaluationDetail) {
+	if err := e.evaluationMemoryStorage.update(ctx, detail.Task.ID, func(params *types.EvaluationDetail) {
 		params.Task.Total = len(dataset)
 		logger.Infof(ctx, "Updated task total to %d QA pairs", params.Task.Total)
-	})
+	}, e.persistEvaluationDetail); err != nil {
+		return fmt.Errorf("persist evaluation progress: %w", err)
+	}
 
 	// Extract and organize passages from dataset
 	passages := getPassageList(dataset)
@@ -432,11 +528,13 @@ func (e *EvaluationService) EvalDataset(ctx context.Context, detail *types.Evalu
 			finished += 1
 			metricResult := metricHook.MetricResult()
 			mu.Unlock()
-			e.evaluationMemoryStorage.update(detail.Task.ID, func(params *types.EvaluationDetail) {
+			if err := e.evaluationMemoryStorage.update(ctx, detail.Task.ID, func(params *types.EvaluationDetail) {
 				params.Metric = metricResult
 				params.Task.Finished = finished
 				logger.Infof(ctx, "Updated task progress: %d/%d completed", finished, params.Task.Total)
-			})
+			}, e.persistEvaluationDetail); err != nil {
+				logger.Errorf(ctx, "Failed to persist evaluation progress: %v", err)
+			}
 			return nil
 		})
 	}
@@ -449,10 +547,12 @@ func (e *EvaluationService) EvalDataset(ctx context.Context, detail *types.Evalu
 	}
 
 	// Final update of evaluation metrics
-	e.evaluationMemoryStorage.update(detail.Task.ID, func(params *types.EvaluationDetail) {
+	if err := e.evaluationMemoryStorage.update(ctx, detail.Task.ID, func(params *types.EvaluationDetail) {
 		params.Metric = metricHook.MetricResult()
 		params.Task.Finished = finished
-	})
+	}, e.persistEvaluationDetail); err != nil {
+		return fmt.Errorf("persist final evaluation result: %w", err)
+	}
 
 	logger.Infof(ctx, "Dataset evaluation completed successfully, task ID: %s", detail.Task.ID)
 	return nil

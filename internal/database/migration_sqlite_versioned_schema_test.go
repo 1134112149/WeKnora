@@ -12,13 +12,14 @@ import (
 // versionedSQLiteTables is the set of tables that SQLite migrations must
 // create to stay in sync with the versioned (PostgreSQL) migrations:
 // 000041 task queue, 000053 system settings, 000055 processing spans,
-// 000063 knowledge multi-tags.
+// 000063 knowledge multi-tags, 000014 evaluation tasks.
 var versionedSQLiteTables = []string{
 	"task_pending_ops",
 	"task_dead_letters",
 	"system_settings",
 	"knowledge_processing_spans",
 	"knowledge_tag_relations",
+	"evaluation_tasks",
 }
 
 // versionedSQLiteColumns maps each existing table to the columns that the
@@ -34,7 +35,7 @@ var versionedSQLiteColumns = map[string][]string{
 	"mcp_tool_approvals": {"enabled"},                        // 000091
 }
 
-const expectedSQLiteMigrationVersion = 13
+const expectedSQLiteMigrationVersion = 14
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)
