@@ -1,0 +1,15 @@
+version: 1
+student:
+  name: "es7"
+  github_id: "1134112149"
+topic:
+  id: "3"
+  title: "质量评测基线与成本可观测"
+result:
+  type: code
+  url: "https://github.com/1134112149/WeKnora/tree/rhino-2026-final-3"
+repository:
+  url: "https://github.com/1134112149/WeKnora.git"
+  branch: "rhino-2026-topic3"
+  commit: "36f792604081856d8e6372e9b55d8c2ee54a8a0a"
+  tag: "rhino-2026-final-3"
